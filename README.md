@@ -9,12 +9,15 @@ Each PLY file becomes one frame of animation, displayed via Blender's visibility
 ## Requirements
 
 - **Blender 5.1+** (tested on 5.1; compatible with 4.0+)
-- **3D Gaussian Splatting addon** — must be installed and enabled first  
-  (the one that provides `bpy.ops.object.import_gaussian_splatting`)
+- **3D Gaussian Splatting addon** by ReshotAI — must be installed and enabled **first**  
+  Download: https://github.com/ReshotAI/gaussian-splatting-blender-addon  
+  (this provides the `bpy.ops.object.import_gaussian_splatting` operator that this addon wraps)
 
 ---
 
 ## Installation
+
+> **Install the [ReshotAI Gaussian Splatting addon](https://github.com/ReshotAI/gaussian-splatting-blender-addon) first** — this addon depends on it and will refuse to import without it.
 
 1. Download [`ply_sequence_importer.zip`](../../releases/latest) from the Releases page.
 2. In Blender: **Edit > Preferences > Add-ons > Install**
