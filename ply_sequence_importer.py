@@ -1,7 +1,7 @@
 bl_info = {
     "name": "PLY Sequence Importer",
     "author": "Arda Evin",
-    "version": (1, 5, 0),
+    "version": (1, 6, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > PLY Sequence",
     "description": "Import a folder of 3DGS PLY files as an animated sequence using the Gaussian Splatting addon",
@@ -11,59 +11,84 @@ bl_info = {
 import bpy
 import glob
 import os
-from bpy.app.handlers import persistent
 from bpy.props import StringProperty, IntProperty, PointerProperty
 from bpy.types import Operator, Panel, PropertyGroup
 
 # ──────────────────────────────────────────────
-# Frame-change handler  (module-level so Blender
-# can reference it by name after file reloads)
+# Visibility driven by KEYFRAMES (render-safe)
+#
+# v1.6.0 — Earlier versions toggled hide_viewport /
+# hide_render from a frame_change_post handler. That
+# triggers a collection / depsgraph resync from inside
+# the render's per-frame depsgraph update and crashes
+# Blender (EXCEPTION_ACCESS_VIOLATION in
+# graph_id_tag_update during RE_RenderAnim).
+#
+# Instead we keyframe each object's visibility with
+# CONSTANT interpolation. The depsgraph evaluates
+# keyframed visibility natively and safely during both
+# viewport playback and rendering, and it persists in
+# the .blend with no runtime handler required.
 # ──────────────────────────────────────────────
 
-def _ply_update_visibility(scene):
-    """Show only the frame object that matches scene.frame_current.
-    Clamps to first frame before the sequence and last frame after it."""
-    props = scene.ply_sequence_props
-    frame_start = props.active_start_frame
-    objects_csv = props.active_frame_objects   # comma-separated object names
-
-    if not objects_csv:
-        return
-
-    names   = objects_csv.split(",")
-    # Clamp: hold first frame before sequence, hold last frame after sequence
-    current = max(0, min(scene.frame_current - frame_start, len(names) - 1))
-
-    for i, name in enumerate(names):
-        obj = bpy.data.objects.get(name)
-        if obj is None:
-            continue
-        visible = (i == current)
-        obj.hide_viewport = not visible
-        obj.hide_render   = not visible
+_VIS_PATHS = ("hide_viewport", "hide_render")
 
 
-# ──────────────────────────────────────────────
-# Persistent load-post handler
-# Re-registers the frame handler every time a
-# .blend file is opened.
-# ──────────────────────────────────────────────
-
-@persistent
-def _ply_load_post(filepath):
-    """Called after every file load — restores the frame-change handler."""
-    _remove_frame_handler()
-
-    # Walk every scene in the file; register handler if any has sequence data
-    for scene in bpy.data.scenes:
-        if scene.ply_sequence_props.active_frame_objects:
-            bpy.app.handlers.frame_change_post.append(_ply_update_visibility)
-            # Trigger once so the correct frame is visible immediately
-            _ply_update_visibility(scene)
-            break   # one handler is enough — it iterates over scenes itself
+def _set_vis_key(obj, frame, hidden):
+    """Insert a hide_viewport + hide_render keyframe on obj at `frame`."""
+    obj.hide_viewport = hidden
+    obj.hide_render = hidden
+    for path in _VIS_PATHS:
+        obj.keyframe_insert(data_path=path, frame=frame)
 
 
-def _remove_frame_handler():
+def _clear_sequence_visibility(frame_objects):
+    """Remove any existing visibility animation from the frame objects.
+
+    The frame objects are fully owned by this addon (static children of the
+    PLY_Sequence empty), so wiping their animation data is safe and avoids
+    version-specific fcurve traversal across Blender 4.x / 5.x action slots.
+    """
+    for obj in frame_objects:
+        if obj and obj.animation_data:
+            obj.animation_data_clear()
+
+
+def _keyframe_sequence_visibility(frame_objects, start):
+    """Keyframe per-frame visibility for the whole sequence.
+
+    Object i is visible only at timeline frame (start + i). CONSTANT
+    interpolation + CONSTANT extrapolation means:
+      • the first object holds visible *before* the sequence  (hold first frame)
+      • the last  object holds visible *after*  the sequence  (hold last  frame)
+    """
+    prefs = bpy.context.preferences.edit
+    old_interp = prefs.keyframe_new_interpolation_type
+    prefs.keyframe_new_interpolation_type = 'CONSTANT'
+    try:
+        n = len(frame_objects)
+        for i, obj in enumerate(frame_objects):
+            if obj is None:
+                continue
+            f = start + i
+            if i == 0:
+                _set_vis_key(obj, f, False)            # visible (held before → hold first)
+                if n > 1:
+                    _set_vis_key(obj, f + 1, True)     # hidden afterwards
+            elif i == n - 1:
+                _set_vis_key(obj, f - 1, True)         # hidden before
+                _set_vis_key(obj, f, False)            # visible (held after → hold last)
+            else:
+                _set_vis_key(obj, f - 1, True)         # hidden before
+                _set_vis_key(obj, f, False)            # visible on its frame
+                _set_vis_key(obj, f + 1, True)         # hidden after
+    finally:
+        prefs.keyframe_new_interpolation_type = old_interp
+
+
+def _remove_legacy_handler():
+    """Strip the old runtime frame-change handler if a pre-1.6 file/session
+    still has it registered. Keyframed visibility replaces it."""
     bpy.app.handlers.frame_change_post[:] = [
         h for h in bpy.app.handlers.frame_change_post
         if getattr(h, '__name__', '') != '_ply_update_visibility'
@@ -128,20 +153,13 @@ def _strip_redundant_attrs(mesh):
 def _tidy_gn_tree(ng):
     """Arrange GaussianSplatting GN nodes into a clean left-to-right layout.
 
-    Works by node *type* so it is robust to name changes across addon versions.
-    Only moves nodes whose type is recognised — unknown nodes are left alone.
+    Only moves nodes whose name is recognised — unknown nodes are left alone.
     """
     if ng is None:
         return
 
     nodes = {n.name: n for n in ng.nodes}
 
-    # ── Map bl_idname → desired (x, y) ───────────────────────────────────
-    # Layout groups:
-    #   Selection chain  (top)    : opacity filter + random display %
-    #   Main flow        (middle) : Group In → Mesh to Points → … → Group Out
-    #   Instance mesh    (upper)  : Ico Sphere → Set Shade Smooth
-    #   Scale/rotation   (bottom) : named attrs → vector maths
     positions = {
         # Selection chain ────────────────────────────────
         "Named Attribute":          (-950,  450),   # opacity
@@ -183,7 +201,7 @@ def _tidy_gn_tree(ng):
 
 
 # ──────────────────────────────────────────────
-# Operator
+# Operator — import sequence
 # ──────────────────────────────────────────────
 
 class PLYSEQ_OT_import(Operator):
@@ -247,7 +265,7 @@ class PLYSEQ_OT_import(Operator):
         # ── Tidy the GN node layout ────────────────────────────────────────
         _tidy_gn_tree(shared_gn)
 
-        # ── Rename, consolidate GN/material, hide each frame object ───────
+        # ── Rename, consolidate GN/material, strip attrs each frame object ─
         frame_objects = []
         for i, obj in enumerate(imported_objects):
             obj.name      = f"frame_{i:04d}"
@@ -275,9 +293,6 @@ class PLYSEQ_OT_import(Operator):
 
             # ── Strip redundant attributes (saves ~50% file size) ──────────
             _strip_redundant_attrs(obj.data)
-
-            obj.hide_viewport = True
-            obj.hide_render   = True
             frame_objects.append(obj)
 
         # ── Empty parent ───────────────────────────────────────────────────
@@ -290,19 +305,20 @@ class PLYSEQ_OT_import(Operator):
             obj.parent = empty
             obj.matrix_parent_inverse = empty.matrix_world.inverted()
 
+        # ── Keyframe visibility (render-safe) ──────────────────────────────
+        _remove_legacy_handler()
+        _clear_sequence_visibility(frame_objects)
+        _keyframe_sequence_visibility(frame_objects, frame_start)
+
         # ── Timeline range ─────────────────────────────────────────────────
         context.scene.frame_start = frame_start
         context.scene.frame_end   = frame_start + len(frame_objects) - 1
 
-        # ── Persist sequence data INTO the scene (survives file save/load) ─
+        # ── Persist sequence data INTO the scene (for the move feature) ────
         props.active_frame_objects = ",".join(obj.name for obj in frame_objects)
         props.active_start_frame   = frame_start
 
-        # ── Register frame-change handler ──────────────────────────────────
-        _remove_frame_handler()
-        bpy.app.handlers.frame_change_post.append(_ply_update_visibility)
-
-        # Show first frame immediately
+        # Refresh to the first frame
         context.scene.frame_set(frame_start)
 
         self.report(
@@ -332,24 +348,65 @@ class PLYSEQ_OT_update_start_frame(Operator):
             return {'CANCELLED'}
 
         new_start = props.start_frame
-        count     = len(props.active_frame_objects.split(","))
+        names     = props.active_frame_objects.split(",")
+        objs      = [bpy.data.objects.get(n) for n in names]
+        count     = len(names)
 
-        # Update stored state
+        # Re-key visibility at the new start frame
+        _remove_legacy_handler()
+        _clear_sequence_visibility(objs)
+        _keyframe_sequence_visibility(objs, new_start)
+
+        # Update stored state + timeline range
         props.active_start_frame = new_start
-
-        # Update timeline range
         context.scene.frame_start = new_start
         context.scene.frame_end   = new_start + count - 1
-
-        # Clamp current frame to valid range and refresh visibility
         context.scene.frame_current = max(new_start,
                                           min(context.scene.frame_current,
                                               new_start + count - 1))
-        _ply_update_visibility(context.scene)
+        context.scene.frame_set(context.scene.frame_current)
 
         self.report({'INFO'},
                     f"Sequence start moved to frame {new_start} "
                     f"(end: {new_start + count - 1}).")
+        return {'FINISHED'}
+
+
+# ──────────────────────────────────────────────
+# Operator — bake/upgrade a pre-1.6 (handler-based) sequence
+# ──────────────────────────────────────────────
+
+class PLYSEQ_OT_bake_visibility(Operator):
+    bl_idname      = "plyseq.bake_visibility"
+    bl_label       = "Bake Visibility Keyframes"
+    bl_description = (
+        "Convert a sequence imported with an older version (runtime handler) to "
+        "render-safe visibility keyframes. Removes the legacy frame-change handler"
+    )
+    bl_options     = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.ply_sequence_props
+
+        if not props.active_frame_objects:
+            self.report({'ERROR'}, "No active sequence found to bake.")
+            return {'CANCELLED'}
+
+        names = props.active_frame_objects.split(",")
+        objs  = [bpy.data.objects.get(n) for n in names]
+        start = props.active_start_frame
+
+        _remove_legacy_handler()
+        _clear_sequence_visibility(objs)
+        _keyframe_sequence_visibility(objs, start)
+
+        context.scene.frame_start = start
+        context.scene.frame_end   = start + len(names) - 1
+        context.scene.frame_set(context.scene.frame_current)
+
+        self.report({'INFO'},
+                    f"Baked render-safe visibility keyframes for {len(names)} frames. "
+                    f"You can now render the animation. Save the file to keep it.")
         return {'FINISHED'}
 
 
@@ -394,6 +451,15 @@ class PLYSEQ_PT_panel(Panel):
             row.prop(props, "start_frame", text="Frame")
             row.operator("plyseq.update_start_frame", text="Apply", icon='FILE_REFRESH')
 
+            # Upgrade button — only needed for files imported with v1.5 or older
+            legacy = any(getattr(h, '__name__', '') == '_ply_update_visibility'
+                         for h in bpy.app.handlers.frame_change_post)
+            if legacy:
+                box.separator()
+                box.label(text="Legacy handler detected:", icon='ERROR')
+                box.operator("plyseq.bake_visibility",
+                             text="Bake Render-Safe Keyframes", icon='KEYFRAME_HLT')
+
         layout.separator()
         col = layout.column(align=True)
         col.label(text="Requires:", icon='INFO')
@@ -408,6 +474,7 @@ _classes = (
     PLYSequenceProperties,
     PLYSEQ_OT_import,
     PLYSEQ_OT_update_start_frame,
+    PLYSEQ_OT_bake_visibility,
     PLYSEQ_PT_panel,
 )
 
@@ -418,16 +485,12 @@ def register():
 
     bpy.types.Scene.ply_sequence_props = PointerProperty(type=PLYSequenceProperties)
 
-    # Register the persistent load-post handler
-    if _ply_load_post not in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.append(_ply_load_post)
+    # Clean up any legacy runtime handler left over from v1.5 or earlier
+    _remove_legacy_handler()
 
 
 def unregister():
-    _remove_frame_handler()
-
-    if _ply_load_post in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.remove(_ply_load_post)
+    _remove_legacy_handler()
 
     if hasattr(bpy.types.Scene, 'ply_sequence_props'):
         del bpy.types.Scene.ply_sequence_props

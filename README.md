@@ -2,7 +2,7 @@
 
 A Blender addon that imports a folder of **3D Gaussian Splatting PLY files** as a frame-by-frame animated sequence.
 
-Each PLY file becomes one frame of animation, displayed via Blender's visibility system — no keyframes needed. The sequence persists across save/reload, automatically trims redundant data to reduce file size, and keeps the GaussianSplatting node tree organized.
+Each PLY file becomes one frame of animation, shown via **render-safe visibility keyframes**. The sequence persists across save/reload with no runtime handler, renders correctly in animation output, automatically trims redundant data to reduce file size, and keeps the GaussianSplatting node tree organized.
 
 ---
 
@@ -61,7 +61,7 @@ The sequence shifts to the new start frame and the timeline updates accordingly.
 
 ### Playback persistence
 
-The sequence survives file save and reload. The frame-change handler is automatically re-registered every time the `.blend` file is opened.
+The sequence survives file save and reload natively — visibility is stored as keyframes on the frame objects, so there is no runtime handler to re-register and nothing to break if the addon is later disabled.
 
 ---
 
@@ -69,8 +69,9 @@ The sequence survives file save and reload. The frame-change handler is automati
 
 | Feature | Detail |
 |---|---|
-| Frame-accurate playback | Driven by Blender's `frame_change_post` handler |
-| Persistent across reloads | Uses `@persistent` load-post handler + scene properties |
+| Frame-accurate playback | Driven by visibility keyframes (CONSTANT interpolation) |
+| Render-safe | Renders correctly in animation output — no per-frame Python handler |
+| Persistent across reloads | Keyframes live in the `.blend`; no handler to re-register |
 | Shared GN + material | All frames share one node group and one material |
 | Automatic size reduction | Removes `sh4–sh15`, `log_opacity`, `logscale`, `quatxyz`, `quatw` |
 | GN auto-layout | Arranges GaussianSplatting nodes into a readable left-to-right flow |
@@ -103,14 +104,14 @@ PLY Folder
          ↓  bpy.ops.object.import_gaussian_splatting()
          ↓  Share GN node group + material
          ↓  Strip redundant attributes
-         ↓  Hide all except current frame
          ↓  Parent to PLY_Sequence empty
-         ↓  Store object list in scene properties (CSV)
+         ↓  Keyframe hide_viewport / hide_render per object
 
-frame_change_post handler
-    → reads scene.ply_sequence_props.active_frame_objects
-    → shows object[frame_current - start_frame]
-    → hides all others
+Visibility keyframes (CONSTANT interp + extrapolation)
+    → object i is visible only at frame (start + i)
+    → first object holds visible before the sequence  (hold first)
+    → last  object holds visible after  the sequence  (hold last)
+    → evaluated natively by the depsgraph in viewport AND render
 ```
 
 ---
@@ -132,6 +133,43 @@ frame_change_post handler
 - Requires the **3D Gaussian Splatting** addon — this addon is a wrapper around it, not a standalone PLY importer.
 - All `.ply` files in the folder are imported; there is no frame range filter.
 - Only one sequence per scene is tracked at a time. Importing again overwrites the tracked sequence.
+
+---
+
+## Troubleshooting
+
+### Blender crashes when rendering the animation (`EXCEPTION_ACCESS_VIOLATION`)
+
+Sequences imported with **v1.5 or earlier** drove visibility from a `frame_change_post`
+handler. Toggling visibility from that handler during a render triggers a collection /
+depsgraph resync mid-frame and crashes Blender (the crash report points at
+`graph_id_tag_update` during `RE_RenderAnim`).
+
+**Fix:** update to **v1.6.0+** and bake the sequence to keyframes:
+
+1. Install the latest `ply_sequence_importer.zip` and restart Blender.
+2. Open your `.blend`, go to the **PLY Sequence** panel.
+3. If a *“Legacy handler detected”* warning appears, click **Bake Render-Safe Keyframes**.
+4. **Save** the file.
+
+The animation will now render without crashing. New imports are render-safe automatically.
+
+---
+
+## Changelog
+
+### v1.6.0
+- **Render-safe visibility.** Visibility is now baked to `hide_viewport` / `hide_render`
+  keyframes (CONSTANT interpolation) instead of a runtime `frame_change_post` handler,
+  fixing a hard crash (`EXCEPTION_ACCESS_VIOLATION`) when rendering the animation.
+- Removed the `@persistent` load handler — keyframes persist in the `.blend` natively.
+- Added **Bake Render-Safe Keyframes** button to upgrade sequences imported with v1.5.
+- *Move start frame* now re-keys the sequence at the new start.
+
+### v1.5.0
+- Auto-tidy the GaussianSplatting GN node tree on import.
+- Strip redundant attributes (`sh4–sh15`, `log_opacity`, `logscale`, `quatxyz`, `quatw`).
+- Post-import start-frame change; hold first/last frame; reload persistence.
 
 ---
 
