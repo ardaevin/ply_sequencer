@@ -54,6 +54,24 @@ If you want to shift the sequence to a different start frame after importing:
 
 The sequence shifts to the new start frame and the timeline updates accordingly.
 
+### Freeze on a single frame
+
+To stop the sequence from playing frame-by-frame and hold one still frame:
+
+1. **Select** the frame object you want to hold (optional — click it in the viewport or Outliner).
+2. In the **PLY Sequence** panel, enable **Freeze Frame**.
+   - If a frame object is selected, that frame is held.
+   - Otherwise the frame currently shown on the timeline is held.
+3. While frozen, drag the **Frozen Frame** slider to hold any other frame, or click
+   **Set to Current Frame** to jump the held frame to the timeline position.
+4. Uncheck **Freeze Frame** to resume normal playback.
+
+While frozen, scrubbing or playing the timeline no longer changes the splat — the chosen
+frame stays on screen. The freeze is **render-safe** and is saved in the `.blend`: a frozen
+sequence renders (and reopens) frozen on the held frame. Internally it mutes the visibility
+keyframes and pins the chosen object visible, so nothing is destroyed — unfreezing restores
+the exact per-frame animation.
+
 ### Frame hold behavior
 
 - **Before the sequence starts**: the first frame is held (no black frames)
@@ -76,6 +94,7 @@ The sequence survives file save and reload natively — visibility is stored as 
 | Automatic size reduction | Removes `sh4–sh15`, `log_opacity`, `logscale`, `quatxyz`, `quatw` |
 | GN auto-layout | Arranges GaussianSplatting nodes into a readable left-to-right flow |
 | Frame hold | Clamps first/last frame outside the sequence range |
+| Freeze frame | Hold any single frame; render-safe, reversible, saved in the `.blend` |
 | Empty parent | All frame objects parented to `PLY_Sequence` for easy transforms |
 | Post-import start frame | Move the whole sequence to any frame without reimporting |
 
@@ -125,6 +144,9 @@ Visibility keyframes (CONSTANT interp + extrapolation)
 | Import PLY Sequence | Runs the full import pipeline |
 | Active Sequence info | Shows frame count and current start frame |
 | Move sequence to / Apply | Shifts the sequence to a new start frame without reimporting |
+| Freeze Frame | Hold a single frame instead of playing the sequence |
+| Frozen Frame | Which frame (0-based) to hold while frozen |
+| Set to Current Frame | Jump the held frame to the current timeline position |
 
 ---
 
@@ -157,6 +179,12 @@ The animation will now render without crashing. New imports are render-safe auto
 ---
 
 ## Changelog
+
+### v1.7.0
+- **Freeze Frame.** New panel toggle to hold a single frame instead of playing the
+  sequence — uses the selected frame object, or the current timeline frame. Includes a
+  *Frozen Frame* slider and *Set to Current Frame* button. Render-safe, reversible, and
+  saved in the `.blend` (mutes the visibility keyframes and pins one frame visible).
 
 ### v1.6.0
 - **Render-safe visibility.** Visibility is now baked to `hide_viewport` / `hide_render`

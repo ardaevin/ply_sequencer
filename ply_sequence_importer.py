@@ -1,7 +1,7 @@
 bl_info = {
     "name": "PLY Sequence Importer",
     "author": "Arda Evin",
-    "version": (1, 6, 0),
+    "version": (1, 7, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > PLY Sequence",
     "description": "Import a folder of 3DGS PLY files as an animated sequence using the Gaussian Splatting addon",
@@ -11,7 +11,7 @@ bl_info = {
 import bpy
 import glob
 import os
-from bpy.props import StringProperty, IntProperty, PointerProperty
+from bpy.props import StringProperty, IntProperty, BoolProperty, PointerProperty
 from bpy.types import Operator, Panel, PropertyGroup
 
 # ──────────────────────────────────────────────
@@ -96,6 +96,121 @@ def _remove_legacy_handler():
 
 
 # ──────────────────────────────────────────────
+# Freeze Frame  (hold a single frame; render-safe)
+#
+# Works by MUTING the visibility fcurves (so the
+# animation no longer drives them) and pinning one
+# object visible via its static hide flags. Muted
+# fcurves + static values are saved in the .blend and
+# honoured by the renderer, so a frozen sequence stays
+# frozen on reload and in animation output.
+# ──────────────────────────────────────────────
+
+_freeze_busy = False
+
+
+def _iter_vis_fcurves(obj):
+    """Yield the hide_viewport / hide_render fcurves of obj across
+    Blender 4.4+ slotted actions and legacy (<=4.3) actions."""
+    ad = obj.animation_data if obj else None
+    if not ad or not ad.action:
+        return
+    act = ad.action
+    layers = getattr(act, "layers", None)
+    if layers and len(getattr(act, "slots", [])) > 0:
+        # Blender 4.4+ slotted actions: layers → strips → channelbag(slot) → fcurves
+        for layer in layers:
+            for strip in layer.strips:
+                for slot in act.slots:
+                    try:
+                        cb = strip.channelbag(slot)
+                    except Exception:
+                        cb = None
+                    if cb:
+                        for fc in cb.fcurves:
+                            if fc.data_path in _VIS_PATHS:
+                                yield fc
+    else:
+        # Legacy actions (Blender <= 4.3)
+        for fc in getattr(act, "fcurves", None) or []:
+            if fc.data_path in _VIS_PATHS:
+                yield fc
+
+
+def _set_vis_mute(obj, mute):
+    for fc in _iter_vis_fcurves(obj):
+        fc.mute = mute
+
+
+def _sequence_objects(props):
+    if not props.active_frame_objects:
+        return []
+    return [bpy.data.objects.get(n) for n in props.active_frame_objects.split(",")]
+
+
+def _selected_frame_index(props):
+    """Index of a selected frame object (active object first), or None."""
+    if not props.active_frame_objects:
+        return None
+    idx_by_name = {n: i for i, n in enumerate(props.active_frame_objects.split(","))}
+    ao = bpy.context.active_object
+    if ao is not None and ao.name in idx_by_name:
+        return idx_by_name[ao.name]
+    for o in getattr(bpy.context, "selected_objects", []):
+        if o.name in idx_by_name:
+            return idx_by_name[o.name]
+    return None
+
+
+def _apply_freeze(scene):
+    """Mute visibility + pin one frame (freeze on) or unmute + refresh (off)."""
+    global _freeze_busy
+    if _freeze_busy:
+        return
+    props = scene.ply_sequence_props
+    objs = _sequence_objects(props)
+    if not objs:
+        return
+    _freeze_busy = True
+    try:
+        if props.freeze_enabled:
+            idx = max(0, min(props.freeze_index, len(objs) - 1))
+            for i, o in enumerate(objs):
+                if o is None:
+                    continue
+                _set_vis_mute(o, True)
+                hidden = (i != idx)
+                o.hide_viewport = hidden
+                o.hide_render = hidden
+        else:
+            for o in objs:
+                if o is None:
+                    continue
+                _set_vis_mute(o, False)
+            scene.frame_set(scene.frame_current)  # re-drive visibility from keyframes
+    finally:
+        _freeze_busy = False
+
+
+def _freeze_enabled_update(self, context):
+    """When turning freeze ON, choose which frame to hold: the selected frame
+    object if one is selected, otherwise the current timeline frame."""
+    scene = context.scene
+    if self.freeze_enabled:
+        count = len(self.active_frame_objects.split(",")) if self.active_frame_objects else 0
+        idx = _selected_frame_index(self)
+        if idx is None:
+            idx = scene.frame_current - self.active_start_frame
+        self["freeze_index"] = max(0, min(idx, max(0, count - 1)))
+    _apply_freeze(scene)
+
+
+def _freeze_index_update(self, context):
+    if self.freeze_enabled:
+        _apply_freeze(context.scene)
+
+
+# ──────────────────────────────────────────────
 # Properties
 # ──────────────────────────────────────────────
 
@@ -112,6 +227,23 @@ class PLYSequenceProperties(PropertyGroup):
         description="Timeline frame number where the sequence begins",
         default=1,
         min=0,
+    )
+
+    # ── Freeze frame ────────────────────────────
+    freeze_enabled: BoolProperty(
+        name="Freeze Frame",
+        description="Hold a single frame instead of playing the sequence. "
+                    "Uses the selected frame object if one is selected, "
+                    "otherwise the current timeline frame",
+        default=False,
+        update=_freeze_enabled_update,
+    )
+    freeze_index: IntProperty(
+        name="Frozen Frame",
+        description="Which frame of the sequence to hold while frozen (0 = first)",
+        default=0,
+        min=0,
+        update=_freeze_index_update,
     )
 
     # ── Saved state (persists inside the .blend) ─
@@ -317,6 +449,7 @@ class PLYSEQ_OT_import(Operator):
         # ── Persist sequence data INTO the scene (for the move feature) ────
         props.active_frame_objects = ",".join(obj.name for obj in frame_objects)
         props.active_start_frame   = frame_start
+        props["freeze_enabled"]    = False   # fresh import starts un-frozen
 
         # Refresh to the first frame
         context.scene.frame_set(frame_start)
@@ -366,6 +499,10 @@ class PLYSEQ_OT_update_start_frame(Operator):
                                               new_start + count - 1))
         context.scene.frame_set(context.scene.frame_current)
 
+        # Preserve a frozen hold across the move
+        if props.freeze_enabled:
+            _apply_freeze(context.scene)
+
         self.report({'INFO'},
                     f"Sequence start moved to frame {new_start} "
                     f"(end: {new_start + count - 1}).")
@@ -404,9 +541,40 @@ class PLYSEQ_OT_bake_visibility(Operator):
         context.scene.frame_end   = start + len(names) - 1
         context.scene.frame_set(context.scene.frame_current)
 
+        if props.freeze_enabled:
+            _apply_freeze(context.scene)
+
         self.report({'INFO'},
                     f"Baked render-safe visibility keyframes for {len(names)} frames. "
                     f"You can now render the animation. Save the file to keep it.")
+        return {'FINISHED'}
+
+
+# ──────────────────────────────────────────────
+# Operator — freeze on the current timeline frame
+# ──────────────────────────────────────────────
+
+class PLYSEQ_OT_freeze_current(Operator):
+    bl_idname      = "plyseq.freeze_current"
+    bl_label       = "Freeze Current Frame"
+    bl_description = "Freeze the sequence on the frame currently shown on the timeline"
+    bl_options     = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.ply_sequence_props
+        if not props.active_frame_objects:
+            self.report({'ERROR'}, "No active sequence.")
+            return {'CANCELLED'}
+
+        count = len(props.active_frame_objects.split(","))
+        idx   = context.scene.frame_current - props.active_start_frame
+        props["freeze_index"]   = max(0, min(idx, count - 1))
+        props["freeze_enabled"] = True
+        _apply_freeze(context.scene)
+
+        self.report({'INFO'},
+                    f"Frozen on frame {props.freeze_index} "
+                    f"(timeline {props.active_start_frame + props.freeze_index}).")
         return {'FINISHED'}
 
 
@@ -438,20 +606,34 @@ class PLYSEQ_PT_panel(Panel):
         layout.separator()
         layout.operator("plyseq.import", icon='IMPORT', text="Import PLY Sequence")
 
-        # Show active sequence info + start-frame override if one is loaded
+        # Show active sequence info + controls if a sequence is loaded
         if props.active_frame_objects:
             layout.separator()
             box = layout.box()
             count = len(props.active_frame_objects.split(","))
             box.label(text="Active Sequence:", icon='SEQUENCE')
             box.label(text=f"  {count} frames  |  current start: {props.active_start_frame}")
+
+            # ── Move sequence ──────────────────────────────
             box.separator()
             box.label(text="Move sequence to:")
             row = box.row(align=True)
             row.prop(props, "start_frame", text="Frame")
             row.operator("plyseq.update_start_frame", text="Apply", icon='FILE_REFRESH')
 
-            # Upgrade button — only needed for files imported with v1.5 or older
+            # ── Freeze frame ───────────────────────────────
+            box.separator()
+            box.prop(props, "freeze_enabled", text="Freeze Frame",
+                     icon='PAUSE', toggle=True)
+            if props.freeze_enabled:
+                sub = box.column(align=True)
+                sub.prop(props, "freeze_index", text="Frozen Frame")
+                tl = props.active_start_frame + props.freeze_index
+                sub.label(text=f"  Holding frame {props.freeze_index}  (timeline {tl})")
+                sub.operator("plyseq.freeze_current",
+                             text="Set to Current Frame", icon='TIME')
+
+            # ── Upgrade button (only for v1.5-or-older files) ──
             legacy = any(getattr(h, '__name__', '') == '_ply_update_visibility'
                          for h in bpy.app.handlers.frame_change_post)
             if legacy:
@@ -475,6 +657,7 @@ _classes = (
     PLYSEQ_OT_import,
     PLYSEQ_OT_update_start_frame,
     PLYSEQ_OT_bake_visibility,
+    PLYSEQ_OT_freeze_current,
     PLYSEQ_PT_panel,
 )
 
