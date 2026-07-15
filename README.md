@@ -1,7 +1,8 @@
-
-
 # PLY Sequence Importer
 
+[![PLY Sequence Importer — demo](media/PlySeqGitHUB.gif)](media/PlySeqGitHUB.mp4)
+
+> ▶️ Preview of the addon in action — **[click to watch the full 1-minute HD video](media/PlySeqGitHUB.mp4)**.
 
 A Blender addon that imports a folder of **3D Gaussian Splatting PLY files** as a frame-by-frame animated sequence.
 
