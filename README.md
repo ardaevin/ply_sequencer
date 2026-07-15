@@ -2,9 +2,6 @@
 
 # PLY Sequence Importer
 
-<video src="https://github.com/ardaevin/ply_sequencer/raw/main/media/PlySeqGitHUB.mp4" controls muted loop playsinline width="100%"></video>
-
-> ▶️ If the player above doesn't load, [watch the demo video](media/PlySeqGitHUB.mp4).
 
 A Blender addon that imports a folder of **3D Gaussian Splatting PLY files** as a frame-by-frame animated sequence.
 
